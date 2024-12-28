@@ -11,7 +11,7 @@ import pyperclip
 import os
 
 # Configuration de l'API (valeurs par défaut)
-DEFAULT_API_KEY = "3cogqTK6ls7dN3WA22iP3U6FOtDuGxF3"
+DEFAULT_API_KEY = "ton numéro d'API"
 DEFAULT_BASE_URL = "https://financialmodelingprep.com/api/v3/historical-price-full/"
 
 
