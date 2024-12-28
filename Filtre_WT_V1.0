@@ -1,0 +1,377 @@
+import sys
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog, \
+    QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QMessageBox, QLineEdit
+from PyQt5.QtGui import QPixmap, QPalette, QBrush, QColor
+from PyQt5.QtCore import Qt
+import pyperclip
+import os
+
+# Configuration de l'API (valeurs par défaut)
+DEFAULT_API_KEY = "3cogqTK6ls7dN3WA22iP3U6FOtDuGxF3"
+DEFAULT_BASE_URL = "https://financialmodelingprep.com/api/v3/historical-price-full/"
+
+
+def get_stock_data(symbol, months=3, api_key=DEFAULT_API_KEY, base_url=DEFAULT_BASE_URL):
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=months * 30)
+    url = f"{base_url}{symbol}?from={start_date.strftime('%Y-%m-%d')}&to={end_date.strftime('%Y-%m-%d')}&apikey={api_key}"
+
+    response = requests.get(url)
+    data = response.json()
+
+    if 'historical' not in data:
+        raise ValueError(f"Données non disponibles pour {symbol}")
+
+    df = pd.DataFrame(data['historical'])
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+    return df
+
+
+def calculate_wavetrend(df, chlen=9, avg=12, malen=3):
+    src = df['close']
+
+    esa = src.ewm(span=chlen).mean()
+    de = (src - esa).abs().ewm(span=chlen).mean()
+    ci = (src - esa) / (0.015 * de)
+    wt1 = ci.ewm(span=avg).mean()
+    wt2 = wt1.rolling(window=malen).mean()
+
+    wtCross = np.where((wt1 > wt2) & (wt1.shift() <= wt2.shift()) |
+                       (wt1 < wt2) & (wt1.shift() >= wt2.shift()), 1, 0)
+    wtCrossUp = wt2 - wt1 <= 0
+
+    return pd.DataFrame({
+        'WT1': wt1,
+        'WT2': wt2,
+        'WTCross': wtCross,
+        'WTCrossUp': wtCrossUp
+    })
+
+
+def find_last_crossover(wt_data):
+    crossover = np.where(wt_data['WTCross'] == 1)[0]
+    if len(crossover) > 0:
+        return crossover[-1]
+    return None
+
+###
+def analyze_stock(symbol, api_key=DEFAULT_API_KEY, base_url=DEFAULT_BASE_URL):
+    try:
+        df = get_stock_data(symbol, api_key=api_key, base_url=base_url)
+        wt_data = calculate_wavetrend(df)
+        df = pd.concat([df, wt_data], axis=1)
+
+        last_crossover_index = find_last_crossover(wt_data)
+
+        if last_crossover_index is not None:
+            crossover_date = df.iloc[last_crossover_index]['date']
+            wt1_value = df.iloc[last_crossover_index]['WT1']
+            wt2_value = df.iloc[last_crossover_index]['WT2']
+            is_bullish = df.iloc[last_crossover_index]['WTCrossUp']
+            cross_type = "Haussier" if is_bullish else "Baissier"
+
+            last_close_date = df['date'].iloc[-1].date()
+            date_str = crossover_date.strftime('%Y-%m-%d')
+
+            today = datetime.now().date()
+            crossover_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            days_diff = (today - crossover_date).days
+
+            is_most_recent = crossover_date == last_close_date
+
+            return [symbol, date_str, days_diff, f"{wt1_value:.2f}", f"{wt2_value:.2f}", cross_type, is_most_recent, is_bullish]
+        else:
+            return [symbol, "Pas de croisement", "-", "-", "-", "-", False, None]
+    except Exception as e:
+        return [symbol, f"Erreur: {str(e)}", "-", "-", "-", "-", False, None]
+
+
+class WaveTrendApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Analyse WaveTrend")
+        self.setGeometry(100, 100, 1024, 768)
+
+        palette = QPalette()
+        pixmap = QPixmap("bull_bear_background.png")
+        scaled_pixmap = pixmap.scaled(self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        palette.setBrush(QPalette.Window, QBrush(scaled_pixmap))
+        self.setPalette(palette)
+
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.layout = QVBoxLayout(self.central_widget)
+
+        self.selected_files = []
+        self.symbols = []
+        self.bullish_symbols = []
+        self.bearish_symbols = []
+
+        self.current_sort_column = 0
+        self.sort_order = Qt.AscendingOrder
+
+        self.logs_dir = "logs"
+        if not os.path.exists(self.logs_dir):
+            os.makedirs(self.logs_dir)
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        # Configuration de l'API et section des fichiers
+        api_layout = QHBoxLayout()
+
+        self.api_key_label = QLabel("Clé API:")
+        self.api_key_label.setStyleSheet("background-color: rgba(255, 255, 255, 200);")
+        self.api_key_input = QLineEdit(DEFAULT_API_KEY)
+        api_layout.addWidget(self.api_key_label)
+        api_layout.addWidget(self.api_key_input)
+
+        self.url_label = QLabel("URL:")
+        self.url_label.setStyleSheet("background-color: rgba(255, 255, 255, 200);")
+        self.url_input = QLineEdit(DEFAULT_BASE_URL)
+        api_layout.addWidget(self.url_label)
+        api_layout.addWidget(self.url_input)
+
+        self.layout.addLayout(api_layout)
+
+        # Ajustement de la taille des boutons principaux
+        self.file_button = QPushButton("Sélectionner des fichiers CSV")
+        self.file_button.setFixedSize(1000, 30)  # Largeur: 200px, Hauteur: 30px
+        self.file_button.clicked.connect(self.select_files)
+        self.layout.addWidget(self.file_button)
+
+        self.titles_label = QLabel("Nombre de titres à analyser : 0")
+        self.titles_label.setStyleSheet("background-color: rgba(255, 255, 255, 200);")
+        self.layout.addWidget(self.titles_label)
+
+        self.analyze_button = QPushButton("Commencer l'Analyse")
+        self.analyze_button.setFixedSize(1000, 30)  # Largeur: 200px, Hauteur: 30px
+        self.analyze_button.clicked.connect(self.start_analysis)
+        self.layout.addWidget(self.analyze_button)
+
+        # Section des croisements haussiers
+        bullish_layout = QHBoxLayout()
+        self.bullish_label = QLabel("Croisements récents haussiers :")
+        self.bullish_label.setStyleSheet("background-color: rgba(255, 255, 255, 200);")
+        bullish_layout.addWidget(self.bullish_label)
+
+        self.copy_bullish_button = QPushButton("Copier les croisements haussiers")
+        self.copy_bullish_button.setFixedSize(250, 30)  # Largeur: 250px, Hauteur: 30px
+        self.copy_bullish_button.clicked.connect(lambda: self.copy_to_clipboard('bullish'))
+        bullish_layout.addWidget(self.copy_bullish_button)
+
+        self.layout.addLayout(bullish_layout)
+
+        # Section des croisements baissiers
+        bearish_layout = QHBoxLayout()
+        self.bearish_label = QLabel("Croisements récents baissiers :")
+        self.bearish_label.setStyleSheet("background-color: rgba(255, 255, 255, 200);")
+        bearish_layout.addWidget(self.bearish_label)
+
+        self.copy_bearish_button = QPushButton("Copier les croisements baissiers")
+        self.copy_bearish_button.setFixedSize(250, 30)  # Largeur: 250px, Hauteur: 30px
+        self.copy_bearish_button.clicked.connect(lambda: self.copy_to_clipboard('bearish'))
+        bearish_layout.addWidget(self.copy_bearish_button)
+
+        self.layout.addLayout(bearish_layout)
+
+        # Configuration de la table
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Titre", "Date", "Nbre de jours", "WT1", "WT2", "Type de croisement"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().sectionClicked.connect(self.handle_sort)
+
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background-color: rgba(255, 255, 255, 175);
+            }
+            QHeaderView::section {
+                background-color: rgba(255, 255, 255, 204);
+            }
+        """)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(self.table)
+        self.layout.addWidget(scroll_area)
+
+        self.quit_button = QPushButton("Quitter")
+        self.quit_button.setFixedSize(1000, 30)  # Largeur: 200px, Hauteur: 30px
+        self.quit_button.clicked.connect(self.close)
+        self.layout.addWidget(self.quit_button)
+
+    def select_files(self):
+        file_names, _ = QFileDialog.getOpenFileNames(self, "Sélectionner des fichiers CSV", "", "CSV Files (*.csv)")
+        if file_names:
+            self.selected_files = file_names
+            self.symbols = []
+            for file_name in self.selected_files:
+                df = pd.read_csv(file_name)
+                self.symbols.extend(df.iloc[:, 0].tolist())
+            self.symbols = list(set(self.symbols))
+            self.titles_label.setText(f"Nombre de titres à analyser : {len(self.symbols)}")
+
+    def handle_sort(self, logical_index):
+        if logical_index == self.current_sort_column:
+            self.sort_order = Qt.DescendingOrder if self.sort_order == Qt.AscendingOrder else Qt.AscendingOrder
+        else:
+            self.sort_order = Qt.AscendingOrder
+            self.current_sort_column = logical_index
+
+        self.sort_table(logical_index, self.sort_order)
+
+    def sort_table(self, column, order):
+        self.table.setSortingEnabled(False)
+
+        data = []
+        for row in range(self.table.rowCount()):
+            row_data = []
+            is_highlighted = self.table.item(row, 0).background().color() == QColor(255, 255, 0)
+            for col in range(self.table.columnCount()):
+                item = self.table.item(row, col)
+                if col == 2:  # Nbre de jours
+                    try:
+                        value = int(item.text()) if item.text() != "-" else float('inf')
+                    except:
+                        value = float('inf')
+                elif col in [3, 4]:  # WT1, WT2
+                    try:
+                        value = float(item.text()) if item.text() != "-" else float('inf')
+                    except:
+                        value = float('inf')
+                else:
+                    value = item.text()
+                row_data.append((value, item.text(),
+                                 item.foreground().color() if item.foreground() != self.table.palette().text() else None))
+            row_data.append(is_highlighted)
+            data.append(row_data)
+
+        data.sort(key=lambda x: x[column][0], reverse=(order == Qt.DescendingOrder))
+
+        for row, row_data in enumerate(data):
+            for col, (_, text, color) in enumerate(row_data[:-1]):
+                item = QTableWidgetItem(text)
+                if col in [2, 3, 4]:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if color is not None:
+                    item.setForeground(color)
+                if row_data[-1]:
+                    item.setBackground(QColor(255, 255, 0))
+                self.table.setItem(row, col, item)
+
+        self.table.setSortingEnabled(True)
+
+    def start_analysis(self):
+        if not self.symbols:
+            QMessageBox.warning(self, "Attention",
+                                "Veuillez sélectionner des fichiers CSV avant de commencer l'analyse.")
+            return
+
+        api_key = self.api_key_input.text()
+        base_url = self.url_input.text()
+
+        results = []
+        self.bullish_symbols = []
+        self.bearish_symbols = []
+
+        for symbol in self.symbols:
+            result = analyze_stock(symbol, api_key=api_key, base_url=base_url)
+            results.append(result)
+            if result[-2]:  # is_most_recent
+                if result[-1]:  # is_bullish
+                    self.bullish_symbols.append(symbol)
+                else:
+                    self.bearish_symbols.append(symbol)
+
+        results.sort(key=lambda x: x[0].lower())
+        self.update_table(results)
+        self.update_recent_labels()
+
+    def update_table(self, results):
+        # Définition des couleurs
+        VERT_PASTEL = QColor(152, 251, 152)  # Pour croisement haussier
+        ROUGE_PASTEL = QColor(255, 160, 122)  # Pour croisement baissier
+
+        self.table.setRowCount(len(results))
+        for i, row in enumerate(results):
+            for j, value in enumerate(row[:-1]):
+                item = QTableWidgetItem(str(value))
+
+                # Alignement à droite pour les colonnes numériques
+                if j in [2, 3, 4]:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+                # Couleur du texte pour la colonne "Type de croisement"
+                if j == 5:
+                    if value == "Haussier":
+                        item.setForeground(Qt.green)
+                    elif value == "Baissier":
+                        item.setForeground(Qt.red)
+
+                self.table.setItem(i, j, item)
+
+            # Surlignage pour les croisements récents
+            if row[-2]:  # is_most_recent
+                color = VERT_PASTEL if row[-1] else ROUGE_PASTEL  # row[-1] est is_bullish
+                for j in range(6):
+                    self.table.item(i, j).setBackground(color)
+
+        self.sort_table(0, Qt.AscendingOrder)
+
+    def update_recent_labels(self):
+        self.bullish_symbols.sort()
+        self.bearish_symbols.sort()
+
+        bullish_str = ", ".join(self.bullish_symbols) if self.bullish_symbols else "Aucun"
+        bearish_str = ", ".join(self.bearish_symbols) if self.bearish_symbols else "Aucun"
+
+        self.bullish_label.setText(f"Croisements récents haussiers : {bullish_str}")
+        self.bearish_label.setText(f"Croisements récents baissiers : {bearish_str}")
+
+        # Enregistrement dans le fichier log
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = os.path.join(self.logs_dir, f"wavetrend_log_{timestamp}.txt")
+
+        with open(log_filename, 'w', encoding='utf-8') as f:
+            f.write(f"Date d'analyse : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("\nCroisements récents haussiers :\n")
+            if self.bullish_symbols:
+                for symbol in self.bullish_symbols:
+                    f.write(f"- {symbol}\n")
+            else:
+                f.write("Aucun croisement haussier récent détecté.\n")
+
+            f.write("\nCroisements récents baissiers :\n")
+            if self.bearish_symbols:
+                for symbol in self.bearish_symbols:
+                    f.write(f"- {symbol}\n")
+            else:
+                f.write("Aucun croisement baissier récent détecté.\n")
+
+    def copy_to_clipboard(self, cross_type):
+        if cross_type == 'bullish' and self.bullish_symbols:
+            symbols_str = ", ".join(self.bullish_symbols)
+            message = "La liste des croisements haussiers a été copiée dans le presse-papier."
+        elif cross_type == 'bearish' and self.bearish_symbols:
+            symbols_str = ", ".join(self.bearish_symbols)
+            message = "La liste des croisements baissiers a été copiée dans le presse-papier."
+        else:
+            QMessageBox.warning(self, "Attention",
+                                f"Aucun croisement {'haussier' if cross_type == 'bullish' else 'baissier'} à copier.")
+            return
+
+        pyperclip.copy(symbols_str)
+        QMessageBox.information(self, "Copié", message)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = WaveTrendApp()
+    window.show()
+    sys.exit(app.exec_())
